@@ -1,0 +1,672 @@
+/**
+ * @file    coffee_dryer.ino
+ * @brief   Secador de café con ESP32 (FreeRTOS) y DS3231: control Peltier 40–45°C,
+ *          motor por intervalos, alarmas acústica/visual, watchdog y ahorro energético.
+ *
+ * @details
+ * - Sensores:
+ *    - DS18B20 (temperatura interna del secador)
+ *    - DHT11 (temperatura y humedad ambiente)
+ * - Actuadores:
+ *    - Celda Peltier (relé)
+ *    - Ventilador (relé) — inverso a Peltier: se enciende cuando la Peltier se apaga
+ *    - Motor (relé) — por intervalos (15 min ON 10 s)
+ *    - Buzzer (< 40°C) y LED (> 45°C) como alarmas
+ * - Tareas FreeRTOS: sensores, control térmico, actuadores (Peltier+fan), motor, supervisor de 36h,
+ *   logger y manejo de botones START/STOP (con ISR y debounce)
+ * - Reloj de tiempo real: DS3231 (I²C). Si el RTC está inválido o perdió energía, se ajusta a
+ *   la hora de compilación automáticamente.
+ * - Ahorro: CPU a 80 MHz; STOP→light-sleep (despierta con START); a las 36 h→deep-sleep.
+ *
+ * @author  Tu equipo
+ * @date    2025
+ */
+
+#include "esp32-hal-timer.h"
+#include <Arduino.h>
+#include <stdarg.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <esp_arduino_version.h>
+#include <WiFi.h>      
+
+/* =======================================================================================
+ *  CONFIGURACIÓN DE PINES Y PARÁMETROS
+ * =======================================================================================
+ */
+
+/**
+ * @name Pines de sensores
+ * @{
+ */
+#define PIN_ONEWIRE         15      ///< DATA del DS18B20 (recomendado con pull-up 4.7k a 3.3V)
+#define PIN_DHT_AMB         4       ///< DATA del DHT11 ambiente
+/** @} */
+
+/**
+ * @name Pines de actuadores (módulo de 4 relés)
+ * @{
+ */
+#define PIN_RELAY_PELTIER   26      ///< Relé de la Peltier
+#define PIN_RELAY_FAN       25      ///< Relé del ventilador (inverso a Peltier)
+#define PIN_RELAY_MOTOR     27      ///< Relé del motor (giro por intervalos)
+/** @} */
+
+/**
+ * @name Pines de botones (a GND con PULLUP e ISR por FALLING)
+ * @{
+ */
+#define PIN_BTN_START       33      ///< Botón START (sirve también como wakeup en light-sleep)
+#define PIN_BTN_STOP        32      ///< Botón STOP
+#define BTN_DEBOUNCE_MS     40      ///< Tiempo de debounce por software (ms)
+/** @} */
+
+/**
+ * @name Pines de alarmas
+ * @{
+ */
+#define PIN_LED_ALARM       2       ///< LED de alarma (>45°C)
+#define PIN_BUZZER          17      ///< Buzzer de alarma (<40°C)
+/** @} */
+
+/**
+ * @name Lógica de relés
+ * @note Coloca 1 si tu módulo de relés es activo en LOW (lo común en módulos de 4 relés).
+ *       Coloca 0 si es activo en HIGH.
+ * @{
+ */
+#define INVERT_PELTIER      1
+#define INVERT_FAN          1
+#define INVERT_MOTOR        1
+/** @} */
+
+/** Tipo del DHT utilizado. */
+#define DHTTYPE             DHT11
+
+/**
+ * @name Umbrales de control por histéresis
+ * @details
+ * - Enciende Peltier si T_IN < 40 °C
+ * - Apaga Peltier si T_IN > 45 °C
+ * @{
+ */
+#define T_ON_C              40.0f
+#define T_OFF_C             45.0f
+/** @} */
+
+/**
+ * @name Parámetros del motor
+ * @{
+ */
+#define MOTOR_PERIOD_MIN    15      ///< Periodicidad del giro (minutos)
+#define MOTOR_ON_SEC        10      ///< Duración del giro (segundos)
+/** @} */
+
+/**
+ * @name Temporización y watchdogs
+ * @{
+ */
+#define CTRL_PERIOD_MS      500             ///< Periodo del lazo de control (ms)
+#define HEATER_WD_MS        5000            ///< Watchdog del actor Peltier (ms)
+#define SENS_TICK_US        5000000ULL      ///< Tick de sensado (µs) → 5 s
+/** @} */
+
+/**
+ * @name Supervisor de tiempo total de ejecución
+ * @{
+ */
+#define RUN_LIMIT_HOURS     36              ///< Límite total de operación (h)
+#define RUN_LIMIT_MS        (RUN_LIMIT_HOURS * 60ULL * 60ULL * 1000ULL) ///< Límite total (ms)
+/** @} */
+
+/** Longitud máxima de línea de log. */
+#define LOG_MSG_MAX         200
+
+/* =======================================================================================
+ *  OBJETOS DE SENSORES / RTC
+ * =======================================================================================
+ */
+
+OneWire oneWire(PIN_ONEWIRE);                 ///< Bus OneWire para el DS18B20
+DallasTemperature ds18b20(&oneWire);          ///< Driver DS18B20
+DeviceAddress dsAddr;                         ///< Dirección del DS18B20
+bool hasDS = false;                           ///< Indica si se detectó el DS18B20
+
+DHT dhtAmb(PIN_DHT_AMB, DHTTYPE);             ///< Driver del DHT11 ambiente
+RTC_DS3231 rtc;                               ///< Reloj de tiempo real DS3231
+
+/* =======================================================================================
+ *  ESTADO COMPARTIDO
+ * =======================================================================================
+ */
+
+/**
+ * @brief Estructura de estado compartido del sistema.
+ * @details Protegida por @ref stateMutex cuando se lee/escribe desde varias tareas.
+ */
+typedef struct {
+  float t_in;          ///< Temperatura interna (DS18B20)
+  bool  t_in_valid;    ///< Lectura interna válida
+  float t_amb;         ///< Temperatura ambiente (DHT11)
+  bool  t_amb_valid;   ///< Lectura ambiente válida
+  float rh_amb;        ///< Humedad relativa ambiente (DHT11)
+  bool  rh_amb_valid;  ///< Lectura de HR válida
+  bool  peltierOn;     ///< Estado real del relé de Peltier
+  bool  systemEnabled; ///< Sistema habilitado por el usuario (START/STOP)
+} SharedState;
+
+SharedState state = {NAN,false, NAN,false, NAN,false, false, true};
+
+/* =======================================================================================
+ *  PRIMITIVAS RTOS
+ * =======================================================================================
+ */
+
+SemaphoreHandle_t stateMutex;        ///< Mutex para @ref state
+SemaphoreHandle_t semSensTick;       ///< Semáforo binario: timer HW → TaskSensors
+SemaphoreHandle_t semBtnStart;       ///< Semáforo binario: ISR START → TaskButtons
+SemaphoreHandle_t semBtnStop;        ///< Semáforo binario: ISR STOP → TaskButtons
+SemaphoreHandle_t semMotorPermit;    ///< Semáforo contador: permisos de giro
+
+QueueHandle_t qHeaterCmd;            ///< Cola (bool): comando ON/OFF para Peltier
+QueueHandle_t qLog;                  ///< Cola (char[]): líneas de log
+
+TaskHandle_t hTaskLogger, hTaskSensors, hTaskCtrl, hTaskHeater,
+             hTaskMotor, hTaskMotorSched, hTaskPower, hTaskButtons;
+
+/** Bits de notificación entre tareas. */
+#define NOTIF_KEEP_ALIVE    (1UL<<0)
+
+/** Timer hardware para el tick de sensado. */
+hw_timer_t* sensTimer = nullptr;
+
+/** Tiempo de arranque del sistema (ms). */
+uint64_t bootMillis = 0;
+
+/** Variables para debounce por software en ISR de botones. */
+volatile uint32_t lastStartISRms = 0, lastStopISRms = 0;
+
+/* =======================================================================================
+ *  HELPERS (FUNCIONES DE APOYO)
+ * =======================================================================================
+ */
+
+/**
+ * @brief Escribe en un relé considerando lógica invertida.
+ * @param pin    GPIO del ESP32 conectado a la entrada del relé.
+ * @param on     true para encender, false para apagar.
+ * @param invert true si el relé es activo en LOW.
+ */
+inline void relayWrite(uint8_t pin, bool on, bool invert) {
+  bool level = invert ? !on : on;
+  digitalWrite(pin, level ? HIGH : LOW);
+}
+
+/** @brief Encendido/apagado de Peltier. */
+inline void peltierWrite(bool on){ relayWrite(PIN_RELAY_PELTIER,on,INVERT_PELTIER); }
+/** @brief Encendido/apagado de ventilador. */
+inline void fanWrite(bool on)    { relayWrite(PIN_RELAY_FAN,    on,INVERT_FAN); }
+/** @brief Encendido/apagado de motor. */
+inline void motorWrite(bool on)  { relayWrite(PIN_RELAY_MOTOR,  on,INVERT_MOTOR); }
+
+/** @brief Control del LED de alarma (>45°C). */
+inline void setLed(bool on){ digitalWrite(PIN_LED_ALARM, on?HIGH:LOW); }
+/** @brief Control del buzzer de alarma (<40°C). */
+inline void setBuzzer(bool on){ digitalWrite(PIN_BUZZER, on?HIGH:LOW); }
+
+/**
+ * @brief Devuelve timestamp del DS3231 en formato "YYYY-mm-dd HH:MM:SS".
+ * @return Cadena con la fecha/hora actual según el RTC.
+ */
+String ts() {
+  DateTime now = rtc.now();
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+  return String(buf);
+}
+
+/**
+ * @brief Envía una línea de log con timestamp al hilo Logger.
+ * @param fmt  Cadena de formato estilo printf.
+ * @param ...  Argumentos variables del formato.
+ */
+void logMsgTS(const char* fmt, ...) {
+  if (!qLog) return;
+  char body[LOG_MSG_MAX-32];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(body, sizeof(body), fmt, ap);
+  va_end(ap);
+  char line[LOG_MSG_MAX];
+  snprintf(line, sizeof(line), "[%s] %s", ts().c_str(), body);
+  xQueueSend(qLog, line, 0);
+}
+
+/**
+ * @brief Verifica si una fecha/hora del RTC es inválida.
+ * @param dt Fecha/hora a validar.
+ * @return true si es inválida; false si es coherente.
+ */
+bool rtcInvalid(const DateTime& dt){
+  return (dt.year()   < 2020 || dt.year()   > 2099 ||
+          dt.month()  < 1    || dt.month()  > 12   ||
+          dt.day()    < 1    || dt.day()    > 31   ||
+          dt.hour()   > 23   || dt.minute() > 59   || dt.second() > 59);
+}
+
+/**
+ * @brief Inicializa el DS3231 y, si está inválido o perdió energía, lo ajusta a la hora de compilación.
+ * @note Requiere conexión I²C: SDA=21, SCL=22 y batería CR2032 en el módulo para mantener la hora.
+ */
+void rtcEnsureValid(){
+  if (!rtc.begin()) {
+    Serial.println("[RTC] No se detecta DS3231 (I2C SDA=21, SCL=22). Los timestamps pueden ser inválidos.");
+    return;
+  }
+  if (rtc.lostPower() || rtcInvalid(rtc.now())) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__))); // hora de compilación
+    Serial.println("[RTC] Ajustado a hora de compilación (auto).");
+  } else {
+    Serial.println("[RTC] OK (hora válida).");
+  }
+}
+
+/**
+ * @brief (Opción A) Stub de envío de "trama" legible. Actualmente vacío para no imprimir
+ *        una segunda línea; se deja para futura expansión si deseas exportar datos.
+ *
+ * @note Si en el futuro quieres enviar una trama (por ejemplo, por Serial1 a otro equipo),
+ *       implementa aquí el formateo deseado y llama a esta función desde TaskSensors().
+ */
+void sendFrame() {
+  // Intencionalmente vacío (no imprime segunda línea).
+}
+
+/* =======================================================================================
+ *  ISRs (Rutinas de Interrupción)
+ * =======================================================================================
+ */
+
+/**
+ * @brief ISR del timer hardware: notifica a TaskSensors un nuevo ciclo de lectura.
+ */
+void IRAM_ATTR onSensTick() {
+  BaseType_t xHigher = pdFALSE;
+  if (semSensTick) xSemaphoreGiveFromISR(semSensTick, &xHigher);
+  portYIELD_FROM_ISR(xHigher);
+}
+
+/**
+ * @brief ISR del botón START con debounce por software.
+ */
+void IRAM_ATTR isrBtnStart() {
+  uint32_t now = millis();
+  if (now - lastStartISRms >= BTN_DEBOUNCE_MS) {
+    lastStartISRms = now;
+    BaseType_t xH = pdFALSE;
+    if (semBtnStart) xSemaphoreGiveFromISR(semBtnStart, &xH);
+    portYIELD_FROM_ISR(xH);
+  }
+}
+
+/**
+ * @brief ISR del botón STOP con debounce por software.
+ */
+void IRAM_ATTR isrBtnStop() {
+  uint32_t now = millis();
+  if (now - lastStopISRms >= BTN_DEBOUNCE_MS) {
+    lastStopISRms = now;
+    BaseType_t xH = pdFALSE;
+    if (semBtnStop) xSemaphoreGiveFromISR(semBtnStop, &xH);
+    portYIELD_FROM_ISR(xH);
+  }
+}
+
+/* =======================================================================================
+ *  TAREAS FREERTOS
+ * =======================================================================================
+ */
+
+/**
+ * @brief Tarea de logger: imprime por Serial las líneas que llegan en @ref qLog.
+ * @param pv No usado.
+ */
+void TaskLogger(void*){
+  char line[LOG_MSG_MAX];
+  for(;;) if (xQueueReceive(qLog, line, portMAX_DELAY)) Serial.println(line);
+}
+
+/**
+ * @brief Tarea de sensores: se ejecuta cada 5 s (tick del timer HW).
+ * @details
+ * Lee DS18B20 (T interna) y DHT11 (T/RH ambiente). Publica resultados en @ref state y
+ * emite un log de una sola línea. Llama a @ref sendFrame() (stub vacío).
+ * @param pv No usado.
+ */
+void TaskSensors(void*){
+  for(;;){
+    if (xSemaphoreTake(semSensTick, portMAX_DELAY) == pdTRUE) {
+      // DS18B20 (interna)
+      ds18b20.requestTemperatures();
+      float t_in = hasDS ? ds18b20.getTempC(dsAddr) : ds18b20.getTempCByIndex(0);
+      bool  t_in_ok = (t_in > -55.0f && t_in < 125.0f);
+
+      // DHT11 (ambiente)
+      float t_amb  = dhtAmb.readTemperature();
+      float rh_amb = dhtAmb.readHumidity();
+      bool  t_amb_ok  = !isnan(t_amb)  && t_amb  > -40 && t_amb  < 85;
+      bool  rh_amb_ok = !isnan(rh_amb) && rh_amb >= 0  && rh_amb <= 100;
+
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(30))) {
+        state.t_in       = t_in;   state.t_in_valid   = t_in_ok;
+        state.t_amb      = t_amb;  state.t_amb_valid  = t_amb_ok;
+        state.rh_amb     = rh_amb; state.rh_amb_valid = rh_amb_ok;
+        xSemaphoreGive(stateMutex);
+      }
+
+      logMsgTS("[Sens] T_IN=%s | AMB: T=%s RH=%s",
+               t_in_ok  ? String(t_in, 2).c_str()   : "--",
+               t_amb_ok ? String(t_amb, 1).c_str()  : "--",
+               rh_amb_ok? String(rh_amb, 0).c_str() : "--");
+
+      // Mantener función para futura exportación de datos (actualmente vacía)
+      sendFrame();
+    }
+  }
+}
+
+/**
+ * @brief Tarea de control térmico por histéresis (40–45 °C).
+ * @details
+ * - Calcula el estado deseado de Peltier (ON/OFF) según T_IN.
+ * - Maneja alarmas: buzzer si T_IN < 40 °C, LED si T_IN > 45 °C.
+ * - Alimenta watchdog del actor enviando notificación a @ref TaskHeater.
+ * @param pv No usado.
+ */
+void TaskControl(void*){
+  bool lastDesired=false;
+  for(;;){
+    vTaskDelay(pdMS_TO_TICKS(CTRL_PERIOD_MS));
+    bool enabled=true, pNow=false;
+    float t_in=NAN; bool t_in_ok=false;
+
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20))) {
+      enabled = state.systemEnabled;
+      pNow    = state.peltierOn;
+      t_in    = state.t_in;  t_in_ok = state.t_in_valid;
+      xSemaphoreGive(stateMutex);
+    }
+
+    bool desired=false;
+    if (enabled) {
+      if (!t_in_ok)             desired = false;       // Failsafe sin medida
+      else if (t_in < T_ON_C)   desired = true;        // Peltier ON
+      else if (t_in > T_OFF_C)  desired = false;       // Peltier OFF
+      else                      desired = pNow;        // Banda muerta
+    }
+
+    // Alarmas solicitadas
+    bool buz = (enabled && t_in_ok && (t_in < T_ON_C));   // <40°C → buzzer ON
+    bool led = (enabled && t_in_ok && (t_in > T_OFF_C));  // >45°C → LED ON
+    setBuzzer(buz);
+    setLed(led);
+
+    if (qHeaterCmd) xQueueOverwrite(qHeaterCmd, &desired);
+    if (hTaskHeater) xTaskNotify(hTaskHeater, NOTIF_KEEP_ALIVE, eSetBits);
+
+    if (desired != lastDesired) {
+      logMsgTS("[Ctrl] T_IN=%.2f => Peltier %s (%s)", t_in, desired?"ON":"OFF", enabled?"EN":"DIS");
+      lastDesired = desired;
+    }
+  }
+}
+
+/**
+ * @brief Tarea del actor Peltier + Ventilador.
+ * @details
+ * - Aplica el último comando recibido en @ref qHeaterCmd.
+ * - El ventilador funciona en lógica inversa a la Peltier:
+ *   Peltier ON → Fan OFF, Peltier OFF → Fan ON.
+ * - Watchdog de 5 s: si no recibe keep-alive, apaga Peltier y deja Fan ON (failsafe).
+ * @param pv No usado.
+ */
+void TaskHeater(void*){
+  bool current=false;             // estado real de Peltier
+  peltierWrite(false);
+  fanWrite(true);                 // inverso: Peltier OFF → fan ON
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20))) { state.peltierOn=false; xSemaphoreGive(stateMutex); }
+  uint32_t lastCmd = millis();
+
+  for(;;){
+    bool enabled=true;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20))) { enabled = state.systemEnabled; xSemaphoreGive(stateMutex); }
+
+    if (!enabled && current){
+      current=false; peltierWrite(false); fanWrite(false);   // STOP → todo OFF
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20))) { state.peltierOn=false; xSemaphoreGive(stateMutex); }
+      logMsgTS("[Peltier] OFF (disabled)");
+    }
+
+    bool cmd;
+    if (xQueueReceive(qHeaterCmd, &cmd, pdMS_TO_TICKS(200))) {
+      lastCmd = millis();
+      if (cmd != current){
+        current = cmd;
+        peltierWrite(current);
+        fanWrite(!current);       // inverso a Peltier
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20))) { state.peltierOn=current; xSemaphoreGive(stateMutex); }
+        logMsgTS("[Act] Peltier=%s, Fan=%s", current?"ON":"OFF", (!current)?"ON":"OFF");
+      }
+    }
+
+    uint32_t notif;
+    if (xTaskNotifyWait(0, 0xFFFFFFFF, &notif, 0) == pdTRUE) {
+      if (notif & NOTIF_KEEP_ALIVE) lastCmd = millis();
+    }
+
+    // Watchdog: failsafe
+    if (millis() - lastCmd > HEATER_WD_MS) {
+      if (current){
+        current=false; peltierWrite(false); fanWrite(true);
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20))) { state.peltierOn=false; xSemaphoreGive(stateMutex); }
+        logMsgTS("[Peltier] Watchdog -> OFF (fan ON)");
+      }
+    }
+  }
+}
+
+/**
+ * @brief Tarea del motor: consume permisos de giro y activa el relé por @ref MOTOR_ON_SEC.
+ * @param pv No usado.
+ */
+void TaskMotor(void*){
+  for(;;){
+    xSemaphoreTake(semMotorPermit, portMAX_DELAY);
+    bool enabled=true;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20))) { enabled = state.systemEnabled; xSemaphoreGive(stateMutex); }
+    if (!enabled){ logMsgTS("[Motor] permiso descartado (disabled)"); continue; }
+    logMsgTS("[Motor] ON %u s", MOTOR_ON_SEC);
+    motorWrite(true);
+    vTaskDelay(pdMS_TO_TICKS(MOTOR_ON_SEC*1000UL));
+    motorWrite(false);
+    logMsgTS("[Motor] OFF");
+  }
+}
+
+/**
+ * @brief Tarea programadora del motor: emite un permiso cada @ref MOTOR_PERIOD_MIN minutos.
+ * @param pv No usado.
+ */
+void TaskMotorScheduler(void*){
+  for(;;){
+    vTaskDelay(pdMS_TO_TICKS(MOTOR_PERIOD_MIN*60UL*1000UL));
+    xSemaphoreGive(semMotorPermit);
+    logMsgTS("[MotorSched] permiso emitido (cada %u min)", MOTOR_PERIOD_MIN);
+  }
+}
+
+/**
+ * @brief Tarea supervisora de energía: a las @ref RUN_LIMIT_HOURS horas entra a deep-sleep.
+ * @param pv No usado.
+ */
+void TaskPowerSupervisor(void*){
+  bootMillis = millis();
+  for(;;){
+    vTaskDelay(pdMS_TO_TICKS(500));
+    if (millis() - bootMillis >= RUN_LIMIT_MS){
+      logMsgTS("[Supervisor] %u h alcanzadas -> deep sleep", RUN_LIMIT_HOURS);
+      peltierWrite(false); fanWrite(false); motorWrite(false);
+      delay(200); esp_deep_sleep_start();
+    }
+  }
+}
+
+/**
+ * @brief Tarea de manejo de botones START/STOP con debounce (por semáforos de ISR).
+ * @details
+ * - STOP: deshabilita sistema, apaga actuadores, entra a light-sleep y despierta con START.
+ * - START: habilita sistema.
+ * @param pv No usado.
+ */
+void TaskButtons(void*){
+  for(;;){
+    if (xSemaphoreTake(semBtnStart, pdMS_TO_TICKS(10)) == pdTRUE) {
+      vTaskDelay(pdMS_TO_TICKS(BTN_DEBOUNCE_MS));
+      if (digitalRead(PIN_BTN_START) == LOW) {
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50))) { state.systemEnabled = true; xSemaphoreGive(stateMutex); }
+        logMsgTS("[Buttons] START -> ENABLED");
+      }
+    }
+    if (xSemaphoreTake(semBtnStop, pdMS_TO_TICKS(10)) == pdTRUE) {
+      vTaskDelay(pdMS_TO_TICKS(BTN_DEBOUNCE_MS));
+      if (digitalRead(PIN_BTN_STOP) == LOW) {
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50))) { state.systemEnabled = false; xSemaphoreGive(stateMutex); }
+        peltierWrite(false); fanWrite(false); motorWrite(false);
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20))) { state.peltierOn=false; xSemaphoreGive(stateMutex); }
+        logMsgTS("[Buttons] STOP -> DISABLED (actuadores OFF)");
+        // Light-sleep y wake por START (nivel LOW)
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BTN_START, 0);
+        logMsgTS("[Power] Light-sleep. Presiona START para despertar.");
+        esp_light_sleep_start();
+        logMsgTS("[Power] Despertó de light-sleep.");
+      }
+    }
+  }
+}
+
+/* =======================================================================================
+ *  SETUP / LOOP
+ * =======================================================================================
+ */
+
+/**
+ * @brief Configuración inicial del sistema (pines, sensores, RTC, RTOS y timer HW).
+ */
+void setup(){
+  Serial.begin(115200); delay(200);
+  Serial.println("\n== ESP32 DOIT - Coffee Dryer (RTOS + DS3231, Opción A: sin trama binaria) ==");
+  setCpuFrequencyMhz(80); // Ahorro energético
+
+  // Actuadores a estado seguro
+  pinMode(PIN_RELAY_PELTIER, OUTPUT); peltierWrite(false);
+  pinMode(PIN_RELAY_FAN,     OUTPUT); fanWrite(true);     // por defecto Peltier OFF → fan ON
+  pinMode(PIN_RELAY_MOTOR,   OUTPUT); motorWrite(false);
+
+  // Alarmas
+  pinMode(PIN_LED_ALARM, OUTPUT); setLed(false);
+  pinMode(PIN_BUZZER,    OUTPUT); setBuzzer(false);
+
+  // Botones
+  pinMode(PIN_BTN_START, INPUT_PULLUP);
+  pinMode(PIN_BTN_STOP,  INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_START), isrBtnStart, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_STOP),  isrBtnStop,  FALLING);
+
+  // Sensores
+  dhtAmb.begin();
+
+  // DS18B20
+  pinMode(PIN_ONEWIRE, INPUT_PULLUP); // ayuda adicional; no reemplaza el pull-up externo
+  ds18b20.begin();
+  if (ds18b20.getAddress(dsAddr, 0)) {
+    hasDS = true; ds18b20.setResolution(dsAddr, 12);
+  } else {
+    hasDS = false; Serial.println("[DS18B20] No se encontró dirección en índice 0.");
+  }
+
+  // RTC DS3231 (SDA=21, SCL=22)
+  Wire.begin();
+  rtcEnsureValid();
+
+  // RTOS primitivas
+  stateMutex      = xSemaphoreCreateMutex();
+  semSensTick     = xSemaphoreCreateBinary();
+  semBtnStart     = xSemaphoreCreateBinary();
+  semBtnStop      = xSemaphoreCreateBinary();
+  semMotorPermit  = xSemaphoreCreateCounting(10, 0);
+  qHeaterCmd      = xQueueCreate(1, sizeof(bool));
+  qLog            = xQueueCreate(16, LOG_MSG_MAX);
+
+  // Timer HW para tick de sensores (compatibilidad core 2.x / 3.x)
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  sensTimer = timerBegin(1000000);             // 1 MHz
+  timerAttachInterrupt(sensTimer, &onSensTick);
+  timerAlarm(sensTimer, SENS_TICK_US, true);   // 5 s
+  timerStart(sensTimer);
+#else
+  sensTimer = timerBegin(0, 80, true);         // 1 MHz (80/80)
+  timerAttachInterrupt(sensTimer, &onSensTick, true);
+  timerAlarmWrite(sensTimer, SENS_TICK_US, true);
+  timerAlarmEnable(sensTimer);
+#endif
+
+  // Tareas
+  xTaskCreatePinnedToCore(TaskLogger,         "Logger",      2048, NULL, 1, &hTaskLogger,      0);
+  xTaskCreatePinnedToCore(TaskSensors,        "Sensors",     3072, NULL, 2, &hTaskSensors,     1);
+  xTaskCreatePinnedToCore(TaskControl,        "Control",     3072, NULL, 3, &hTaskCtrl,        0);
+  xTaskCreatePinnedToCore(TaskHeater,         "Heater",      3072, NULL, 3, &hTaskHeater,      0);
+  xTaskCreatePinnedToCore(TaskMotor,          "Motor",       2048, NULL, 1, &hTaskMotor,       1);
+  xTaskCreatePinnedToCore(TaskMotorScheduler, "MotorSched",  2048, NULL, 1, &hTaskMotorSched,  1);
+  xTaskCreatePinnedToCore(TaskPowerSupervisor,"PowerSup",    2048, NULL, 2, &hTaskPower,       0);
+  xTaskCreatePinnedToCore(TaskButtons,        "Buttons",     2048, NULL, 2, &hTaskButtons,     0);
+
+  bootMillis = millis();
+  logMsgTS("Listo: histéresis %.1f-%.1f°C (T_IN), motor %umin/%us, límite %uh. CPU=80MHz",
+           T_ON_C, T_OFF_C, MOTOR_PERIOD_MIN, MOTOR_ON_SEC, RUN_LIMIT_HOURS);
+}
+
+/**
+ * @brief Bucle principal vacío: toda la lógica corre en tareas FreeRTOS.
+ */
+void loop(){ /* todo corre en tareas */ }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
